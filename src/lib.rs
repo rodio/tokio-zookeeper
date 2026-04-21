@@ -194,8 +194,8 @@
 #![deny(missing_copy_implementations)]
 
 use error::Error;
-use futures::{Stream, channel::oneshot};
-use snafu::{ResultExt, whatever as bail};
+use futures::{channel::oneshot, Stream};
+use snafu::{whatever as bail, ResultExt};
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::time;
@@ -204,6 +204,8 @@ use tracing::{debug, instrument, trace};
 /// Per-operation ZooKeeper error types.
 pub mod error;
 mod proto;
+/// Recipes from the ZooKeeper docs
+pub mod recipes;
 mod transform;
 mod types;
 
