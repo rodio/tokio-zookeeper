@@ -24,12 +24,29 @@ impl LeaderElection {
         }
     }
     /// Participate in leader election
+    ///
+    /// # Returns
+    ///
+    /// A [futures::channel::oneshot::Receiver] that resolves once this node
+    /// becomes a leader. Dropping it does not remove the underlying ephemeral
+    /// znodes and this node continues to be considered as a participant.
+    ///
+    /// Upon receiving from this receiver applications may consider creating
+    /// a separate znode to acknowledge that the leader has executed the leader
+    /// procedure.
     pub async fn volunteer(mut self) -> Result<futures::channel::oneshot::Receiver<()>, ()> {
         info!("volunteering for leader election");
+
+        // TODO error handling with guids:
+        // https://zookeeper.apache.org/doc/current/recipes.html#sc_recipes_GuidNote
+        // "If a recoverable error occurs calling create() the client should
+        // call getChildren() and check for a node containing the guid used in the path
+        // name. This handles the case (noted above) of the create() succeeding on the
+        // server but the server crashing before returning the name of the new node."
         let path = self
             .zk
             .create(
-                &format!("{}/guid-n_", self.election_node), // todo guid
+                &format!("{}/guid-n_", self.election_node),
                 &b""[..],
                 Acl::open_unsafe(),
                 CreateMode::EphemeralSequential,
@@ -49,8 +66,10 @@ impl LeaderElection {
     }
 
     async fn observe(self, leader_sender: futures::channel::oneshot::Sender<()>) {
-        assert!(self.my_path.is_some());
+        assert!(self.my_path.is_some()); // TODO could be `ActiveLeaderElection`?
         loop {
+            assert!(self.my_path.is_some());
+            // TODO handle errors properly here
             let mut children: Vec<ElectionChild> = self
                 .zk
                 .get_children(&self.election_node)
@@ -66,26 +85,40 @@ impl LeaderElection {
             trace!(participants = ?children, "got leader election participants");
 
             match children
-                    .iter()
-                    .position(|s| format!("{}/{}", self.election_node, s.0) == *self.my_path.as_ref().unwrap()) // todo get rid of formats
-                {
-                    Some(0) => {
-                        info!("i am the leader"); 
-                        _ = leader_sender.send(()); // todo check error
-                        return; // todo acknowledge that users may want to create a node to acknowledge
-                    }
-                    Some(index) => {
-                        info!("i am a follower");
-                        let preceeding_node =
-                            ElectionChild::try_from(format!("{}/{}", self.election_node, children.get(index-1).unwrap().0)).unwrap();
-                        debug!(?preceeding_node, "setting the watch for the preceeding node");
-                        let (rx, _stat) = self.zk.with_watcher().exists(&preceeding_node.0).await.unwrap(); // todo check it existed TOCTOU
-                        let event = rx.await.unwrap(); // todo check that it is a delete event 
-                        debug!(?event, "preceeding node was removed");
-                    }
-                    None => unimplemented!("can't find myself"), // TOCTOU
-                };
+                .iter()
+                .position(|node| self.get_full_path(node) == *self.my_path.as_ref().unwrap())
+            {
+                Some(0) => {
+                    info!("i am the leader");
+                    _ = leader_sender.send(()); // TODO check error
+                    return;
+                }
+                Some(index) => {
+                    info!("i am a follower");
+                    let preceeding_node = &children
+                        .get(index - 1)
+                        .expect("zero should be covered in another match arm");
+                    let preceeding_node_full_path = self.get_full_path(preceeding_node);
+                    debug!(
+                        ?preceeding_node_full_path,
+                        "setting the watch for the preceeding node"
+                    );
+                    let (rx, _stat) = self
+                        .zk
+                        .with_watcher()
+                        .exists(&preceeding_node_full_path)
+                        .await
+                        .unwrap(); // TODO check _stat to see node still exists TOCTOU
+                    let event = rx.await.unwrap(); // TODO check error and that it is a delete event or else what?
+                    debug!(?event, "preceeding node was removed");
+                }
+                None => unimplemented!("can't find myself"), // TODO TOCTOU, try again? forever?
+            };
         }
+    }
+
+    fn get_full_path(&self, election_child: &ElectionChild) -> String {
+        format!("{}/{}", self.election_node, election_child.0)
     }
 }
 
@@ -93,15 +126,15 @@ impl LeaderElection {
 struct ElectionChild(String);
 
 impl TryFrom<String> for ElectionChild {
-    type Error = (); // todo
+    type Error = (); // TODO
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        Ok(Self(value)) // todo
+        Ok(Self(value)) // TODO error when there's no guid, etc.
     }
 }
 
 impl PartialOrd for ElectionChild {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0) // todo change when guids
+        self.0.partial_cmp(&other.0) // TODO change when guids
     }
 }
 
