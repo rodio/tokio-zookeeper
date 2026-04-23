@@ -107,9 +107,10 @@ impl PartialOrd for ElectionChild {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use crate::ZooKeeperBuilder;
+    use std::time::Duration;
+    use tokio::time;
 
     fn init_tracing_subscriber() {
         let _ = tracing_subscriber::fmt()
@@ -120,20 +121,54 @@ mod tests {
     #[tokio::test]
     async fn election_works() {
         let builder = ZooKeeperBuilder::default();
+        let connect_addr = "127.0.0.1:2181".parse().unwrap();
 
         init_tracing_subscriber();
 
-        let connect_addr = "127.0.0.1:2181".parse().unwrap();
         let (zk1, _w) = builder.connect(&connect_addr).await.unwrap();
-        let (zk2, _w) = builder.connect(&connect_addr).await.unwrap();
-
-        let leader_election1 = LeaderElection::new(zk1, "/election");
-        let leader_election2 = LeaderElection::new(zk2, "/election");
-
+        let leader_election1 = LeaderElection::new(zk1.clone(), "/election");
         let f1 = leader_election1.volunteer();
-        let f2 = leader_election2.volunteer();
+        let mut rx1 = f1.await.unwrap();
+        assert!(
+            wait_for_leadership(&mut rx1).await,
+            "testing that the first participant becomes the leader"
+        );
 
-        _ = f1.await;
-        _ = f2.await;
+        let (zk2, _w) = builder.connect(&connect_addr).await.unwrap();
+        let leader_election2 = LeaderElection::new(zk2, "/election");
+        let f2 = leader_election2.volunteer();
+        let mut rx2 = f2.await.unwrap();
+
+        assert_eq!(
+            wait_for_leadership(&mut rx2).await,
+            false,
+            "testing that the second participant is not the leader"
+        );
+
+        drop(zk1);
+        assert_eq!(
+            wait_for_leadership(&mut rx2).await,
+            true,
+            "testing that the second participant now becomes the leader"
+        );
+    }
+
+    async fn wait_for_leadership(rx: &mut futures::channel::oneshot::Receiver<()>) -> bool {
+        let mut retries = 0;
+        loop {
+            match rx.try_recv() {
+                Ok(Some(_)) => return true,
+                Ok(None) => {
+                    retries += 1;
+                    _ = time::sleep(Duration::from_millis(100)).await;
+                    if retries > 50 {
+                        return false;
+                    }
+                }
+                _ => {
+                    panic!("closed channel");
+                }
+            }
+        }
     }
 }
