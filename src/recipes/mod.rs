@@ -1,40 +1,250 @@
-use tracing::Instrument;
+use futures::channel::oneshot::Canceled;
+use snafu::{OptionExt, ResultExt, Whatever};
+use tokio::task::JoinHandle;
+use tracing::{Instrument, error, warn};
 use tracing::{debug, info, trace, trace_span};
 
 use crate::Acl;
 use crate::CreateMode;
+use crate::WatchedEventType::NodeDeleted;
 use crate::ZooKeeper;
 
+use tokio::sync::watch;
+
+use backon::ExponentialBuilder;
+use backon::Retryable;
+
 /// Participate in leader election through this struct
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LeaderElection {
     /// ZNode under which volunteers are registered
     election_node: String,
     zk: ZooKeeper,
-    my_path: Option<String>,
+    backon_builder: ExponentialBuilder,
+}
+
+/// Represents the current state this node is in
+#[derive(Debug, Clone, Copy)]
+pub enum LeadershipState {
+    /// This node is a follower
+    Follower,
+    /// This node is the leader
+    Leader,
+    /// Leadership participation procedure has not yet started
+    Uninitialized,
+    /// An error has occured in the leader election procedure
+    Error(&'static str),
+}
+
+#[derive(Debug)]
+enum ObserveError {
+    Canceled,
+    ZkError(String),
+    SendError(String),
+    LeaderNodeMissing,
+    LeaderNodeChanged,
+    FollowerNodeUnexpectedChange(String),
+    NoParticipants,
+}
+
+impl From<tokio::sync::watch::error::SendError<LeadershipState>> for ObserveError {
+    fn from(value: tokio::sync::watch::error::SendError<LeadershipState>) -> Self {
+        ObserveError::SendError(value.to_string())
+    }
+}
+
+impl From<crate::Error> for ObserveError {
+    fn from(value: crate::Error) -> Self {
+        ObserveError::ZkError(value.to_string())
+    }
+}
+
+impl From<Canceled> for ObserveError {
+    fn from(_value: Canceled) -> Self {
+        ObserveError::Canceled
+    }
+}
+
+#[derive(Debug)]
+struct Candidate {
+    zk: ZooKeeper,
+    path: String,
+    election_node: String,
+}
+
+impl Candidate {
+    fn new(path: String, election_node: String, zk: ZooKeeper) -> Self {
+        Self {
+            zk,
+            path,
+            election_node,
+        }
+    }
+
+    async fn observe(self, leader_sender: tokio::sync::watch::Sender<LeadershipState>) {
+        loop {
+            match self.observe_once(&leader_sender).await {
+                Ok(_) => continue,
+                Err(e) => match e {
+                    ObserveError::Canceled => {
+                        _ = leader_sender.send(LeadershipState::Error(
+                            "Watch receiver canceled, server disconnected?",
+                        ));
+                        return;
+                    }
+                    ObserveError::ZkError(e) => {
+                        error!("ZooKeeper error: {e}");
+                        _ = leader_sender.send(LeadershipState::Error("ZooKeeper error"));
+                        return;
+                    }
+                    ObserveError::SendError(e) => {
+                        error!("Unable to send leadership state update: {e}");
+                        return;
+                    }
+                    ObserveError::LeaderNodeMissing => {
+                        _ = leader_sender
+                            .send(LeadershipState::Error("Leader's znode was missing"));
+                        return;
+                    }
+                    ObserveError::LeaderNodeChanged => {
+                        _ = leader_sender
+                            .send(LeadershipState::Error("Leader's znode has changed"));
+                        return;
+                    }
+                    ObserveError::NoParticipants => {
+                        _ = leader_sender
+                            .send(LeadershipState::Error("No leader election participants"));
+                        return;
+                    }
+                    ObserveError::FollowerNodeUnexpectedChange(e) => {
+                        error!("Unexpected change to follower ephemeral node: {e}");
+                        _ = leader_sender.send(LeadershipState::Error(
+                            "Unexpected change to follower ephemeral node",
+                        ));
+                        return;
+                    }
+                },
+            }
+        }
+    }
+
+    async fn observe_once(
+        &self,
+        leader_sender: &tokio::sync::watch::Sender<LeadershipState>,
+    ) -> Result<(), ObserveError> {
+        let mut children: Vec<ElectionChild> = get_children(&self.zk, &self.election_node).await?;
+        children.sort_unstable();
+
+        trace!(participants = ?children, "got leader election participants");
+
+        match children
+            .iter()
+            .position(|node| self.get_full_path(node) == *self.path)
+        {
+            Some(0) => {
+                self.observe_leader(&leader_sender).await?;
+            }
+            Some(index) => {
+                self.observe_follower(&children[index - 1], &leader_sender)
+                    .await?;
+            }
+            None => unimplemented!("can't find myself"), // TODO TOCTOU, try again? forever?
+        };
+
+        Ok(())
+    }
+
+    async fn observe_leader(
+        &self,
+        leader_sender: &tokio::sync::watch::Sender<LeadershipState>,
+    ) -> Result<(), ObserveError> {
+        // start watching my own ephemeral node
+        let (rx, stat) = self.zk.with_watcher().exists(&self.path).await?;
+        if stat.is_none() {
+            return Err(ObserveError::LeaderNodeMissing);
+        }
+
+        info!("i am the leader");
+        leader_sender.send(LeadershipState::Leader)?;
+
+        let event = rx.await?;
+        error!(?event, "leader's ephemeral node changed");
+        Err(ObserveError::LeaderNodeChanged)
+    }
+
+    async fn observe_follower(
+        &self,
+        preceding_node: &ElectionChild,
+        leader_sender: &tokio::sync::watch::Sender<LeadershipState>,
+    ) -> Result<(), ObserveError> {
+        let path = self.get_full_path(preceding_node);
+        debug!(?path, "setting the watch for the preceding node");
+
+        let (rx, stat) = self.zk.with_watcher().exists(&path).await?;
+        if stat.is_none() {
+            debug!("preceding node already gone, re-evaluating");
+            return Ok(());
+        }
+
+        leader_sender.send(LeadershipState::Follower)?;
+
+        let event = rx.await?;
+        match event.event_type {
+            NodeDeleted => {
+                debug!(?event, "the preceding node was removed");
+                Ok(())
+            }
+            _ => Err(ObserveError::FollowerNodeUnexpectedChange(format!(
+                "{:?}",
+                event.event_type
+            ))),
+        }
+    }
+
+    fn get_full_path(&self, election_child: &ElectionChild) -> String {
+        format!("{}/{}", self.election_node, election_child.0)
+    }
 }
 
 impl LeaderElection {
     /// Create a new leader election struct
     pub fn new(zk: ZooKeeper, election_node: &str) -> Self {
+        let backon_builder = ExponentialBuilder::default()
+            .with_jitter()
+            .with_min_delay(core::time::Duration::from_millis(100))
+            .with_max_delay(core::time::Duration::from_millis(5000))
+            .with_max_times(5);
+
         Self {
             election_node: election_node.to_string(),
             zk,
-            my_path: None,
+            backon_builder,
         }
     }
-    /// Participate in leader election
+    /// Participate in [leader election](https://zookeeper.apache.org/doc/current/recipes.html#sc_leaderElection)
     ///
     /// # Returns
     ///
-    /// A [futures::channel::oneshot::Receiver] that resolves once this node
-    /// becomes a leader. Dropping it does not remove the underlying ephemeral
-    /// znodes and this node continues to be considered as a participant.
+    /// - A [tokio::sync::watch::Receiver] that resolves once this node becomes a
+    /// leader. To stop participating, drop the underlying ZooKeeper connection,
+    /// so that the underlying ephemeral znodes are removed.
+    /// - A [tokio::runtime::task::join::JoinHandle]. Call .abort() to stop
+    /// participating in leader election. If a connection to ZooKeeper is  kept
+    /// alive after this call, the ephemeral nodes are not removed making it it
+    /// seem like you're still participating
     ///
-    /// Upon receiving from this receiver applications may consider creating
-    /// a separate znode to acknowledge that the leader has executed the leader
+    /// Upon receiving from this receiver applications may consider creating a
+    /// separate znode to acknowledge that the leader has executed the leader
     /// procedure.
-    pub async fn volunteer(mut self) -> Result<futures::channel::oneshot::Receiver<()>, ()> {
+    pub async fn volunteer(
+        self,
+    ) -> Result<
+        (
+            tokio::sync::watch::Receiver<LeadershipState>,
+            JoinHandle<()>,
+        ),
+        Whatever,
+    > {
         info!("volunteering for leader election");
 
         // TODO error handling with guids:
@@ -43,82 +253,47 @@ impl LeaderElection {
         // call getChildren() and check for a node containing the guid used in the path
         // name. This handles the case (noted above) of the create() succeeding on the
         // server but the server crashing before returning the name of the new node."
-        let path = self
+        let path = match self
             .zk
             .create(
                 &format!("{}/guid-n_", self.election_node),
                 &b""[..],
-                Acl::open_unsafe(),
+                Acl::open_unsafe(), // todo
                 CreateMode::EphemeralSequential,
             )
             .await
-            .unwrap()
-            .unwrap();
-        self.my_path = Some(path.clone());
+        {
+            Ok(create_res) => {
+                // if this is an err, it is "unrecoverable": no parent node, etc.
+                create_res.whatever_context("can't create ephemeral node, unrecoverable error")?
+            }
+            Err(e) => {
+                warn!("can't get children: {e}, recoverable error, will now retry...");
+                (|| async {
+                    get_children(&self.zk, &self.election_node)
+                        .await
+                        .map_err(|e| format!("{e:?}"))
+                        .whatever_context("retry failed")
+                })
+                .retry(self.backon_builder)
+                .await?
+                .into_iter()
+                .find(|child| child.0.starts_with("guid-n_"))
+                .map(|child| child.0)
+                .whatever_context("can't find my guid")?
+            }
+        };
 
-        let (leader_sender, leader_receiver) = futures::channel::oneshot::channel();
-        tokio::spawn(
-            self.observe(leader_sender)
+        let (leader_sender, leader_receiver) = watch::channel(LeadershipState::Uninitialized);
+        let candidate = Candidate::new(path.clone(), self.election_node, self.zk);
+
+        let jh = tokio::spawn(
+            candidate
+                .observe(leader_sender)
                 .instrument(trace_span!("election_observer", my_path = %path)),
         );
 
-        Ok(leader_receiver)
-    }
-
-    async fn observe(self, leader_sender: futures::channel::oneshot::Sender<()>) {
-        assert!(self.my_path.is_some()); // TODO could be `ActiveLeaderElection`?
-        loop {
-            assert!(self.my_path.is_some());
-            // TODO handle errors properly here
-            let mut children: Vec<ElectionChild> = self
-                .zk
-                .get_children(&self.election_node)
-                .await
-                .unwrap()
-                .unwrap()
-                .into_iter()
-                .map(|s| ElectionChild::try_from(s).unwrap())
-                .collect();
-
-            children.sort_unstable();
-
-            trace!(participants = ?children, "got leader election participants");
-
-            match children
-                .iter()
-                .position(|node| self.get_full_path(node) == *self.my_path.as_ref().unwrap())
-            {
-                Some(0) => {
-                    info!("i am the leader");
-                    _ = leader_sender.send(()); // TODO check error
-                    return;
-                }
-                Some(index) => {
-                    info!("i am a follower");
-                    let preceeding_node = &children
-                        .get(index - 1)
-                        .expect("zero should be covered in another match arm");
-                    let preceeding_node_full_path = self.get_full_path(preceeding_node);
-                    debug!(
-                        ?preceeding_node_full_path,
-                        "setting the watch for the preceeding node"
-                    );
-                    let (rx, _stat) = self
-                        .zk
-                        .with_watcher()
-                        .exists(&preceeding_node_full_path)
-                        .await
-                        .unwrap(); // TODO check _stat to see node still exists TOCTOU
-                    let event = rx.await.unwrap(); // TODO check error and that it is a delete event or else what?
-                    debug!(?event, "preceeding node was removed");
-                }
-                None => unimplemented!("can't find myself"), // TODO TOCTOU, try again? forever?
-            };
-        }
-    }
-
-    fn get_full_path(&self, election_child: &ElectionChild) -> String {
-        format!("{}/{}", self.election_node, election_child.0)
+        Ok((leader_receiver, jh))
     }
 }
 
@@ -138,12 +313,23 @@ impl PartialOrd for ElectionChild {
     }
 }
 
+async fn get_children(
+    zk: &ZooKeeper,
+    election_node: &str,
+) -> Result<Vec<ElectionChild>, ObserveError> {
+    Ok(zk
+        .get_children(election_node)
+        .await?
+        .ok_or(ObserveError::NoParticipants)?
+        .into_iter()
+        .map(|s| ElectionChild::try_from(s).unwrap())
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ZooKeeperBuilder;
-    use std::time::Duration;
-    use tokio::time;
 
     fn init_tracing_subscriber() {
         let _ = tracing_subscriber::fmt()
@@ -159,9 +345,8 @@ mod tests {
         init_tracing_subscriber();
 
         let (zk1, _w) = builder.connect(&connect_addr).await.unwrap();
-        let leader_election1 = LeaderElection::new(zk1.clone(), "/election");
-        let f1 = leader_election1.volunteer();
-        let mut rx1 = f1.await.unwrap();
+        let leader_election1 = LeaderElection::new(zk1, "/election");
+        let (mut rx1, jh1) = leader_election1.volunteer().await.unwrap();
         assert!(
             wait_for_leadership(&mut rx1).await,
             "testing that the first participant becomes the leader"
@@ -169,16 +354,16 @@ mod tests {
 
         let (zk2, _w) = builder.connect(&connect_addr).await.unwrap();
         let leader_election2 = LeaderElection::new(zk2, "/election");
-        let f2 = leader_election2.volunteer();
-        let mut rx2 = f2.await.unwrap();
+        let (mut rx2, _jh2) = leader_election2.volunteer().await.unwrap();
 
         assert_eq!(
-            wait_for_leadership(&mut rx2).await,
-            false,
+            wait_for_follower(&mut rx2).await,
+            true,
             "testing that the second participant is not the leader"
         );
 
-        drop(zk1);
+        jh1.abort();
+
         assert_eq!(
             wait_for_leadership(&mut rx2).await,
             true,
@@ -186,21 +371,34 @@ mod tests {
         );
     }
 
-    async fn wait_for_leadership(rx: &mut futures::channel::oneshot::Receiver<()>) -> bool {
-        let mut retries = 0;
+    async fn wait_for_leadership(rx: &mut tokio::sync::watch::Receiver<LeadershipState>) -> bool {
+        println!("waiting for leadership");
         loop {
-            match rx.try_recv() {
-                Ok(Some(_)) => return true,
-                Ok(None) => {
-                    retries += 1;
-                    _ = time::sleep(Duration::from_millis(100)).await;
-                    if retries > 50 {
-                        return false;
-                    }
+            let state = *rx.borrow_and_update();
+            match state {
+                LeadershipState::Leader => {
+                    return true;
                 }
-                _ => {
-                    panic!("closed channel");
+                LeadershipState::Uninitialized | LeadershipState::Follower => {
+                    rx.changed().await.unwrap()
                 }
+                _ => panic!("wait for leadership error {state:?}"),
+            }
+        }
+    }
+
+    async fn wait_for_follower(rx: &mut tokio::sync::watch::Receiver<LeadershipState>) -> bool {
+        println!("waiting for follower");
+        loop {
+            let state = *rx.borrow_and_update();
+            match state {
+                LeadershipState::Leader | LeadershipState::Uninitialized => {
+                    rx.changed().await.unwrap()
+                }
+                LeadershipState::Follower => {
+                    return true;
+                }
+                _ => panic!("wait for follower error {state:?}"),
             }
         }
     }
