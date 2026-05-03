@@ -1,8 +1,7 @@
-use futures::channel::oneshot::Canceled;
-use snafu::{OptionExt, ResultExt, Whatever};
-use tokio::task::JoinHandle;
+use snafu::{OptionExt, ResultExt, Whatever, whatever};
+use tokio::task::AbortHandle;
 use tracing::{Instrument, error, warn};
-use tracing::{debug, info, trace, trace_span};
+use tracing::{debug, info, trace_span};
 
 use crate::Acl;
 use crate::CreateMode;
@@ -14,11 +13,15 @@ use tokio::sync::watch;
 use backon::ExponentialBuilder;
 use backon::Retryable;
 
+static CANT_SEND_ERROR_MSG: &str = "Can't send leadership state update";
+static RX_CANCELLED_ERROR_MSG: &str = "Watch receiver canceled, server disconnected?";
+static ZNODE_NOT_FOUND_ERROR_MSG: &str = "The ephemeral znode of the participant was not found";
+
 /// Participate in leader election through this struct
 #[derive(Debug)]
 pub struct LeaderElection {
     /// ZNode under which volunteers are registered
-    election_node: String,
+    election_prefix: String,
     zk: ZooKeeper,
     backon_builder: ExponentialBuilder,
 }
@@ -33,122 +36,64 @@ pub enum LeadershipState {
     /// Leadership participation procedure has not yet started
     Uninitialized,
     /// An error has occured in the leader election procedure
-    Error(&'static str),
-}
-
-#[derive(Debug)]
-enum ObserveError {
-    Canceled,
-    ZkError(String),
-    SendError(String),
-    LeaderNodeMissing,
-    LeaderNodeChanged,
-    FollowerNodeUnexpectedChange(String),
-    NoParticipants,
-}
-
-impl From<tokio::sync::watch::error::SendError<LeadershipState>> for ObserveError {
-    fn from(value: tokio::sync::watch::error::SendError<LeadershipState>) -> Self {
-        ObserveError::SendError(value.to_string())
-    }
-}
-
-impl From<crate::Error> for ObserveError {
-    fn from(value: crate::Error) -> Self {
-        ObserveError::ZkError(value.to_string())
-    }
-}
-
-impl From<Canceled> for ObserveError {
-    fn from(_value: Canceled) -> Self {
-        ObserveError::Canceled
-    }
+    Error,
 }
 
 #[derive(Debug)]
 struct Candidate {
     zk: ZooKeeper,
-    path: String,
-    election_node: String,
+    node: ElectionChild,
+    backon_builder: ExponentialBuilder,
+    // election_base_path: String,
 }
 
 impl Candidate {
-    fn new(path: String, election_node: String, zk: ZooKeeper) -> Self {
+    fn new(node: ElectionChild, zk: ZooKeeper, backon_builder: ExponentialBuilder) -> Self {
         Self {
             zk,
-            path,
-            election_node,
+            node,
+            backon_builder,
+            // election_base_path: election_base_path.to_string(),
         }
     }
 
-    async fn observe(self, leader_sender: tokio::sync::watch::Sender<LeadershipState>) {
+    async fn observe(self, leader_sender: watch::Sender<LeadershipState>) {
         loop {
-            match self.observe_once(&leader_sender).await {
+            match (|| async { self.observe_once(&leader_sender).await })
+                .retry(self.backon_builder)
+                .when(|e| e.to_string() == ZNODE_NOT_FOUND_ERROR_MSG)
+                .await
+            {
+                // match self.observe_once(&leader_sender).await {
                 Ok(_) => continue,
-                Err(e) => match e {
-                    ObserveError::Canceled => {
-                        _ = leader_sender.send(LeadershipState::Error(
-                            "Watch receiver canceled, server disconnected?",
-                        ));
-                        return;
-                    }
-                    ObserveError::ZkError(e) => {
-                        error!("ZooKeeper error: {e}");
-                        _ = leader_sender.send(LeadershipState::Error("ZooKeeper error"));
-                        return;
-                    }
-                    ObserveError::SendError(e) => {
-                        error!("Unable to send leadership state update: {e}");
-                        return;
-                    }
-                    ObserveError::LeaderNodeMissing => {
-                        _ = leader_sender
-                            .send(LeadershipState::Error("Leader's znode was missing"));
-                        return;
-                    }
-                    ObserveError::LeaderNodeChanged => {
-                        _ = leader_sender
-                            .send(LeadershipState::Error("Leader's znode has changed"));
-                        return;
-                    }
-                    ObserveError::NoParticipants => {
-                        _ = leader_sender
-                            .send(LeadershipState::Error("No leader election participants"));
-                        return;
-                    }
-                    ObserveError::FollowerNodeUnexpectedChange(e) => {
-                        error!("Unexpected change to follower ephemeral node: {e}");
-                        _ = leader_sender.send(LeadershipState::Error(
-                            "Unexpected change to follower ephemeral node",
-                        ));
-                        return;
-                    }
-                },
+                Err(e) => {
+                    error!("{e}");
+                    _ = leader_sender.send(LeadershipState::Error);
+                    return;
+                }
             }
         }
     }
 
     async fn observe_once(
         &self,
-        leader_sender: &tokio::sync::watch::Sender<LeadershipState>,
-    ) -> Result<(), ObserveError> {
-        let mut children: Vec<ElectionChild> = get_children(&self.zk, &self.election_node).await?;
+        leader_sender: &watch::Sender<LeadershipState>,
+    ) -> Result<(), crate::Error> {
+        let mut children: Vec<ElectionChild> =
+            get_children(&self.zk, &self.node.election_prefix).await?;
         children.sort_unstable();
 
-        trace!(participants = ?children, "got leader election participants");
+        debug!(participants = ?children, "got leader election participants");
 
-        match children
-            .iter()
-            .position(|node| self.get_full_path(node) == *self.path)
-        {
+        match children.iter().position(|node| node == &self.node) {
             Some(0) => {
-                self.observe_leader(&leader_sender).await?;
+                self.observe_leader(leader_sender).await?;
             }
             Some(index) => {
-                self.observe_follower(&children[index - 1], &leader_sender)
+                self.observe_follower(&children[index - 1], leader_sender)
                     .await?;
             }
-            None => unimplemented!("can't find myself"), // TODO TOCTOU, try again? forever?
+            None => whatever!("{}", ZNODE_NOT_FOUND_ERROR_MSG),
         };
 
         Ok(())
@@ -156,28 +101,38 @@ impl Candidate {
 
     async fn observe_leader(
         &self,
-        leader_sender: &tokio::sync::watch::Sender<LeadershipState>,
-    ) -> Result<(), ObserveError> {
+        leader_sender: &watch::Sender<LeadershipState>,
+    ) -> Result<(), crate::Error> {
         // start watching my own ephemeral node
-        let (rx, stat) = self.zk.with_watcher().exists(&self.path).await?;
+        let (rx, stat) = self
+            .zk
+            .with_watcher()
+            .exists(&self.node.full_path())
+            .await?;
         if stat.is_none() {
-            return Err(ObserveError::LeaderNodeMissing);
+            whatever!("Leader's znode was missing");
         }
 
         info!("i am the leader");
-        leader_sender.send(LeadershipState::Leader)?;
+        leader_sender
+            .send(LeadershipState::Leader)
+            .whatever_context(CANT_SEND_ERROR_MSG)?;
 
-        let event = rx.await?;
+        let event = rx.await.whatever_context(RX_CANCELLED_ERROR_MSG)?;
+
         error!(?event, "leader's ephemeral node changed");
-        Err(ObserveError::LeaderNodeChanged)
+        whatever!(
+            "Unexpected change to the leader's node: {:?}",
+            event.event_type
+        );
     }
 
     async fn observe_follower(
         &self,
         preceding_node: &ElectionChild,
-        leader_sender: &tokio::sync::watch::Sender<LeadershipState>,
-    ) -> Result<(), ObserveError> {
-        let path = self.get_full_path(preceding_node);
+        leader_sender: &watch::Sender<LeadershipState>,
+    ) -> Result<(), crate::Error> {
+        let path = preceding_node.full_path();
         debug!(?path, "setting the watch for the preceding node");
 
         let (rx, stat) = self.zk.with_watcher().exists(&path).await?;
@@ -186,23 +141,21 @@ impl Candidate {
             return Ok(());
         }
 
-        leader_sender.send(LeadershipState::Follower)?;
+        leader_sender
+            .send(LeadershipState::Follower)
+            .whatever_context(CANT_SEND_ERROR_MSG)?;
 
-        let event = rx.await?;
+        let event = rx.await.whatever_context(RX_CANCELLED_ERROR_MSG)?;
         match event.event_type {
             NodeDeleted => {
                 debug!(?event, "the preceding node was removed");
                 Ok(())
             }
-            _ => Err(ObserveError::FollowerNodeUnexpectedChange(format!(
-                "{:?}",
+            _ => whatever!(
+                "Unexpected change to the follower's node: {:?}",
                 event.event_type
-            ))),
+            ),
         }
-    }
-
-    fn get_full_path(&self, election_child: &ElectionChild) -> String {
-        format!("{}/{}", self.election_node, election_child.0)
     }
 }
 
@@ -216,7 +169,7 @@ impl LeaderElection {
             .with_max_times(5);
 
         Self {
-            election_node: election_node.to_string(),
+            election_prefix: election_node.to_string(),
             zk,
             backon_builder,
         }
@@ -226,25 +179,19 @@ impl LeaderElection {
     /// # Returns
     ///
     /// - A [tokio::sync::watch::Receiver] that resolves once this node becomes a
-    /// leader. To stop participating, drop the underlying ZooKeeper connection,
-    /// so that the underlying ephemeral znodes are removed.
+    ///   leader. To stop participating, drop the underlying ZooKeeper connection,
+    ///   so that the underlying ephemeral znodes are removed.
     /// - A [tokio::runtime::task::join::JoinHandle]. Call .abort() to stop
-    /// participating in leader election. If a connection to ZooKeeper is  kept
-    /// alive after this call, the ephemeral nodes are not removed making it it
-    /// seem like you're still participating
+    ///   participating in leader election. If a connection to ZooKeeper is  kept
+    ///   alive after this call, the ephemeral nodes are not removed making it it
+    ///   seem like you're still participating
     ///
     /// Upon receiving from this receiver applications may consider creating a
     /// separate znode to acknowledge that the leader has executed the leader
     /// procedure.
     pub async fn volunteer(
         self,
-    ) -> Result<
-        (
-            tokio::sync::watch::Receiver<LeadershipState>,
-            JoinHandle<()>,
-        ),
-        Whatever,
-    > {
+    ) -> Result<(watch::Receiver<LeadershipState>, AbortHandle), Whatever> {
         info!("volunteering for leader election");
 
         // TODO error handling with guids:
@@ -253,10 +200,11 @@ impl LeaderElection {
         // call getChildren() and check for a node containing the guid used in the path
         // name. This handles the case (noted above) of the create() succeeding on the
         // server but the server crashing before returning the name of the new node."
+        let guid = "guid";
         let path = match self
             .zk
             .create(
-                &format!("{}/guid-n_", self.election_node),
+                &format!("{}/{}-n_", self.election_prefix, guid),
                 &b""[..],
                 Acl::open_unsafe(), // todo
                 CreateMode::EphemeralSequential,
@@ -264,28 +212,32 @@ impl LeaderElection {
             .await
         {
             Ok(create_res) => {
-                // if this is an err, it is "unrecoverable": no parent node, etc.
+                // if this is an err, it is "unrecoverable": no parent node, node already exists, etc.
                 create_res.whatever_context("can't create ephemeral node, unrecoverable error")?
             }
             Err(e) => {
-                warn!("can't get children: {e}, recoverable error, will now retry...");
+                warn!(
+                    "can't get children: {e}, recoverable error, will now try to find my guid again..."
+                );
                 (|| async {
-                    get_children(&self.zk, &self.election_node)
+                    get_children(&self.zk, &self.election_prefix)
                         .await
-                        .map_err(|e| format!("{e:?}"))
-                        .whatever_context("retry failed")
+                        .whatever_context("can't get leader election nodes, retry failed")
                 })
                 .retry(self.backon_builder)
                 .await?
                 .into_iter()
-                .find(|child| child.0.starts_with("guid-n_"))
-                .map(|child| child.0)
-                .whatever_context("can't find my guid")?
+                .find(|child| child.guid == guid)
+                .map(|child| child.full_path())
+                .whatever_context("can't find a znode with my guid")?
             }
         };
 
+        let node = ElectionChild::try_from_full_path(&path, &self.election_prefix)
+            .whatever_context("wrong format of the election child node")?;
+
         let (leader_sender, leader_receiver) = watch::channel(LeadershipState::Uninitialized);
-        let candidate = Candidate::new(path.clone(), self.election_node, self.zk);
+        let candidate = Candidate::new(node, self.zk, self.backon_builder);
 
         let jh = tokio::spawn(
             candidate
@@ -293,36 +245,96 @@ impl LeaderElection {
                 .instrument(trace_span!("election_observer", my_path = %path)),
         );
 
-        Ok((leader_receiver, jh))
+        Ok((leader_receiver, jh.abort_handle()))
     }
 }
 
-#[derive(PartialEq, Eq, Debug, Ord)]
-struct ElectionChild(String);
+#[derive(PartialEq, Eq, Debug)]
+struct ElectionChild {
+    election_prefix: String,
+    path: String,
+    guid: String,
+    seq: u32,
+}
 
-impl TryFrom<String> for ElectionChild {
-    type Error = (); // TODO
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Ok(Self(value)) // TODO error when there's no guid, etc.
+impl ElectionChild {
+    fn try_from_full_path(full_path: &str, election_prefix: &str) -> Result<Self, crate::Error> {
+        if !full_path.starts_with(election_prefix) {
+            whatever!(
+                "wrong format of a child node; must start with election prefix {election_prefix}"
+            );
+        }
+
+        let Some(path) = full_path.strip_prefix(&format!("{}/", election_prefix)) else {
+            whatever!("wrong format of a child node; must be `/prefix/path`");
+        };
+
+        let path_parts = path.split("-n_").collect::<Vec<&str>>();
+        if path_parts.len() != 2 {
+            whatever!("wrong format of a child node's path; must `<guid>-n_<number>`");
+        }
+        let guid = path_parts[0].to_string();
+        let seq = path_parts[1]
+            .parse::<u32>()
+            .whatever_context("cant parse node's sequential number as u32 from {full_path}: {e}")?;
+
+        Ok(Self {
+            election_prefix: election_prefix.to_string(),
+            path: path.to_string(),
+            guid,
+            seq,
+        })
+    }
+
+    fn try_from_parts(prefix: &str, path: &str) -> Result<Self, crate::Error> {
+        let path_parts = path.split("-n_").collect::<Vec<&str>>();
+        if path_parts.len() != 2 {
+            whatever!("wrong format of a child node's path; must `<guid>-n_<number>`");
+        }
+        let guid = path_parts[0].to_string();
+        let seq = path_parts[1].parse::<u32>().whatever_context(format!(
+            "cant parse node's sequential number as u32 from prefix `{prefix}` and path `{path}`"
+        ))?;
+
+        Ok(Self {
+            election_prefix: prefix.to_string(),
+            path: path.to_string(),
+            guid,
+            seq,
+        })
+    }
+
+    fn full_path(&self) -> String {
+        format!("{}/{}", self.election_prefix, self.path)
     }
 }
 
 impl PartialOrd for ElectionChild {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0) // TODO change when guids
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ElectionChild {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.seq.cmp(&other.seq)
     }
 }
 
 async fn get_children(
     zk: &ZooKeeper,
     election_node: &str,
-) -> Result<Vec<ElectionChild>, ObserveError> {
+) -> Result<Vec<ElectionChild>, crate::Error> {
     Ok(zk
         .get_children(election_node)
         .await?
-        .ok_or(ObserveError::NoParticipants)?
+        .unwrap_or_default()
         .into_iter()
-        .map(|s| ElectionChild::try_from(s).unwrap())
+        .filter_map(|s| {
+            ElectionChild::try_from_parts(election_node, &s)
+                .inspect_err(|e| warn!("skipping malformed election child {s:?}: {e}"))
+                .ok()
+        })
         .collect())
 }
 
@@ -335,6 +347,17 @@ mod tests {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
+    }
+
+    #[test]
+    fn parse_path() {
+        init_tracing_subscriber();
+        let ok_path = "/election/guid-n_000123";
+        let c = ElectionChild::try_from_full_path(ok_path, "/election").unwrap();
+        assert_eq!(c.election_prefix, "/election");
+        assert_eq!(c.path, "guid-n_000123");
+        assert_eq!(c.guid, "guid");
+        assert_eq!(c.full_path(), "/election/guid-n_000123");
     }
 
     #[tokio::test]
