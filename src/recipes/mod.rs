@@ -2,6 +2,7 @@ use snafu::{OptionExt, ResultExt, Whatever, whatever};
 use tokio::task::AbortHandle;
 use tracing::{Instrument, error, warn};
 use tracing::{debug, info, trace_span};
+use uuid::Uuid;
 
 use crate::Acl;
 use crate::CreateMode;
@@ -197,13 +198,13 @@ impl LeaderElection {
     ) -> Result<(watch::Receiver<LeadershipState>, AbortHandle), Whatever> {
         info!("volunteering for leader election");
 
-        // TODO error handling with guids:
+        // Error handling with guids:
         // https://zookeeper.apache.org/doc/current/recipes.html#sc_recipes_GuidNote
         // "If a recoverable error occurs calling create() the client should
         // call getChildren() and check for a node containing the guid used in the path
-        // name. This handles the case (noted above) of the create() succeeding on the
+        // name. This handles the case [...] of the create() succeeding on the
         // server but the server crashing before returning the name of the new node."
-        let guid = "guid";
+        let guid = Uuid::new_v4();
         let path = match self
             .zk
             .create(
@@ -259,7 +260,7 @@ impl LeaderElection {
 struct ElectionChild {
     election_prefix: String,
     path: String,
-    guid: String,
+    guid: Uuid,
     seq: u32,
 }
 
@@ -279,7 +280,7 @@ impl ElectionChild {
         if path_parts.len() != 2 {
             whatever!("wrong format of a child node's path; must `<guid>-n_<number>`");
         }
-        let guid = path_parts[0].to_string();
+        let guid = Uuid::parse_str(path_parts[0]).whatever_context("Can't parse node's guid")?;
         let seq = path_parts[1]
             .parse::<u32>()
             .whatever_context("cant parse node's sequential number as u32 from {full_path}: {e}")?;
@@ -297,7 +298,7 @@ impl ElectionChild {
         if path_parts.len() != 2 {
             whatever!("wrong format of a child node's path; must `<guid>-n_<number>`");
         }
-        let guid = path_parts[0].to_string();
+        let guid = Uuid::parse_str(path_parts[0]).whatever_context("Can't parse node's guid")?;
         let seq = path_parts[1].parse::<u32>().whatever_context(format!(
             "cant parse node's sequential number as u32 from prefix `{prefix}` and path `{path}`"
         ))?;
@@ -358,12 +359,13 @@ mod tests {
     #[test]
     fn parse_path() {
         init_tracing_subscriber();
-        let ok_path = "/election/guid-n_000123";
-        let c = ElectionChild::try_from_full_path(ok_path, "/election").unwrap();
+        let guid = Uuid::new_v4();
+        let ok_path = format!("/election/{}-n_000123", guid);
+        let c = ElectionChild::try_from_full_path(&ok_path, "/election").unwrap();
         assert_eq!(c.election_prefix, "/election");
-        assert_eq!(c.path, "guid-n_000123");
-        assert_eq!(c.guid, "guid");
-        assert_eq!(c.full_path(), "/election/guid-n_000123");
+        assert_eq!(c.path, format!("{}-n_000123", guid));
+        assert_eq!(c.guid, guid);
+        assert_eq!(c.full_path(), format!("/election/{}-n_000123", guid));
     }
 
     #[tokio::test]
@@ -401,7 +403,7 @@ mod tests {
     }
 
     async fn wait_for_leadership(rx: &mut tokio::sync::watch::Receiver<LeadershipState>) -> bool {
-        println!("waiting for leadership");
+        debug!("waiting for leadership");
         loop {
             let state = *rx.borrow_and_update();
             match state {
@@ -417,7 +419,7 @@ mod tests {
     }
 
     async fn wait_for_follower(rx: &mut tokio::sync::watch::Receiver<LeadershipState>) -> bool {
-        println!("waiting for follower");
+        debug!("waiting for follower");
         loop {
             let state = *rx.borrow_and_update();
             match state {
