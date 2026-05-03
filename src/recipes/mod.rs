@@ -61,6 +61,9 @@ impl Candidate {
         loop {
             match (|| async { self.observe_once(&leader_sender).await })
                 .retry(self.backon_builder)
+                .notify(|err, dur| {
+                    warn!("retrying {:?} after {:?}", err, dur);
+                })
                 .when(|e| e.to_string() == ZNODE_NOT_FOUND_ERROR_MSG)
                 .await
             {
@@ -225,6 +228,9 @@ impl LeaderElection {
                         .whatever_context("can't get leader election nodes, retry failed")
                 })
                 .retry(self.backon_builder)
+                .notify(|err, dur| {
+                    warn!("retrying {:?} after {:?}", err, dur);
+                })
                 .await?
                 .into_iter()
                 .find(|child| child.guid == guid)
