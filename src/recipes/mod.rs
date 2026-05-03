@@ -25,6 +25,7 @@ pub struct LeaderElection {
     election_prefix: String,
     zk: ZooKeeper,
     backon_builder: ExponentialBuilder,
+    acl: &'static [Acl],
 }
 
 /// Represents the current state this node is in
@@ -165,7 +166,7 @@ impl Candidate {
 
 impl LeaderElection {
     /// Create a new leader election struct
-    pub fn new(zk: ZooKeeper, election_node: &str) -> Self {
+    pub fn new(zk: ZooKeeper, election_node: &str, acl: &'static [Acl]) -> Self {
         let backon_builder = ExponentialBuilder::default()
             .with_jitter()
             .with_min_delay(core::time::Duration::from_millis(100))
@@ -176,6 +177,7 @@ impl LeaderElection {
             election_prefix: election_node.to_string(),
             zk,
             backon_builder,
+            acl,
         }
     }
     /// Participate in [leader election](https://zookeeper.apache.org/doc/current/recipes.html#sc_leaderElection)
@@ -210,7 +212,7 @@ impl LeaderElection {
             .create(
                 &format!("{}/{}-n_", self.election_prefix, guid),
                 &b""[..],
-                Acl::open_unsafe(), // todo
+                self.acl,
                 CreateMode::EphemeralSequential,
             )
             .await
@@ -376,7 +378,7 @@ mod tests {
         init_tracing_subscriber();
 
         let (zk1, _w) = builder.connect(&connect_addr).await.unwrap();
-        let leader_election1 = LeaderElection::new(zk1, "/election");
+        let leader_election1 = LeaderElection::new(zk1, "/election", Acl::open_unsafe());
         let (mut rx1, jh1) = leader_election1.volunteer().await.unwrap();
         assert!(
             wait_for_leadership(&mut rx1).await,
@@ -384,7 +386,7 @@ mod tests {
         );
 
         let (zk2, _w) = builder.connect(&connect_addr).await.unwrap();
-        let leader_election2 = LeaderElection::new(zk2, "/election");
+        let leader_election2 = LeaderElection::new(zk2, "/election", Acl::open_unsafe());
         let (mut rx2, _jh2) = leader_election2.volunteer().await.unwrap();
 
         assert_eq!(
