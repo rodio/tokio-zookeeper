@@ -40,6 +40,159 @@ pub enum LeadershipState {
     Error,
 }
 
+impl LeaderElection {
+    /// Create a new leader election struct
+    pub fn new(zk: ZooKeeper, election_node: &str, acl: &'static [Acl]) -> Self {
+        let backon_builder = ExponentialBuilder::default()
+            .with_jitter()
+            .with_min_delay(core::time::Duration::from_millis(100))
+            .with_max_delay(core::time::Duration::from_millis(5000))
+            .with_max_times(5);
+
+        Self {
+            election_prefix: election_node.to_string(),
+            zk,
+            backon_builder,
+            acl,
+        }
+    }
+    /// Participate in [leader election](https://zookeeper.apache.org/doc/current/recipes.html#sc_leaderElection)
+    ///
+    /// # Returns
+    ///
+    /// - A [tokio::sync::watch::Receiver] that resolves once this node becomes a
+    ///   leader. To stop participating, drop the underlying ZooKeeper connection,
+    ///   so that the underlying ephemeral znodes are removed.
+    /// - A [tokio::runtime::task::abort::AbortHandle]. Call .abort() to stop
+    ///   participating in leader election. If a connection to ZooKeeper is  kept
+    ///   alive after this call, the ephemeral nodes are not removed making it it
+    ///   seem like you're still participating
+    ///
+    /// Upon receiving from this receiver applications may consider creating a
+    /// separate znode to acknowledge that the leader has executed the leader
+    /// procedure.
+    ///
+    /// Here is an example of how this might be used:
+    ///
+    /// ```ignore
+    /// use tokio::select;
+    /// use tokio_zookeeper::{Acl, ZooKeeper, recipes::leader::*};
+
+    /// fn init_tracing_subscriber() {
+    ///     let _ = tracing_subscriber::fmt()
+    ///         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+    ///         .init();
+    /// }
+
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     init_tracing_subscriber();
+    ///     let binding = "127.0.0.1:2181".parse().unwrap();
+    ///     let (zk, _default_watcher) = ZooKeeper::connect(&binding).await.unwrap();
+
+    ///     let leader_election = LeaderElection::new(zk, "/election", Acl::open_unsafe());
+    ///     let (mut leader_receiver, _abort_handle) = leader_election.volunteer().await.unwrap();
+    ///     loop {
+    ///         let state = *leader_receiver.borrow_and_update();
+    ///         match state {
+    ///             LeadershipState::Leader => {
+    ///                 select! {
+    ///                     _ = leader_receiver.changed() => { println!("changed");  }
+    ///                     _ = async  {
+    ///                         loop {
+    ///                             println!("doing leader work...");
+    ///                             tokio::time::sleep(tokio::time::Duration::from_secs(1_000)).await
+    ///                         }
+    ///                     } =>  {}
+    ///                 }
+    ///             }
+    ///             LeadershipState::Follower => {
+    ///                 select! {
+    ///                     _ = leader_receiver.changed() => { println!("changed");  }
+    ///                     _ = async  {
+    ///                         loop {
+    ///                             println!("doing follower work...");
+    ///                             tokio::time::sleep(tokio::time::Duration::from_secs(1_000)).await
+    ///                         }
+    ///                     } =>  unreachable!("select should cancel the future")
+    ///                 }
+    ///             }
+    ///             LeadershipState::Uninitialized => {
+    ///                 println!("uninitialized");
+    ///                 _ = leader_receiver.changed().await;
+    ///             }
+    ///             LeadershipState::Error => {
+    ///                 eprintln!("error");
+    ///                 return;
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// ```
+    pub async fn volunteer(
+        self,
+    ) -> Result<(watch::Receiver<LeadershipState>, AbortHandle), Whatever> {
+        info!("volunteering for leader election");
+
+        // Error handling with guids:
+        // https://zookeeper.apache.org/doc/current/recipes.html#sc_recipes_GuidNote
+        // "If a recoverable error occurs calling create() the client should
+        // call getChildren() and check for a node containing the guid used in the path
+        // name. This handles the case [...] of the create() succeeding on the
+        // server but the server crashing before returning the name of the new node."
+        let guid = Uuid::new_v4();
+        let path = match self
+            .zk
+            .create(
+                &format!("{}/{}-n_", self.election_prefix, guid),
+                &b""[..],
+                self.acl,
+                CreateMode::EphemeralSequential,
+            )
+            .await
+        {
+            Ok(create_res) => {
+                // if this is an err, it is "unrecoverable": no parent node, node already exists, etc.
+                create_res.whatever_context("can't create ephemeral node, unrecoverable error")?
+            }
+            Err(e) => {
+                warn!(
+                    "can't get children: {e}, recoverable error, will now try to find my guid again..."
+                );
+                (|| async {
+                    get_children(&self.zk, &self.election_prefix)
+                        .await
+                        .whatever_context(format!("can't get leader election nodes, retry failed"))
+                })
+                .retry(self.backon_builder)
+                .notify(|err, dur| {
+                    warn!("retrying {:?} after {:?}", err, dur);
+                })
+                .await?
+                .into_iter()
+                .find(|child| child.guid == guid)
+                .map(|child| child.full_path())
+                .whatever_context("can't find a znode with my guid")?
+            }
+        };
+
+        let node = ElectionChild::try_from_full_path(&path, &self.election_prefix)
+            .whatever_context("wrong format of the election child node")?;
+
+        let (leader_sender, leader_receiver) = watch::channel(LeadershipState::Uninitialized);
+        let candidate = Candidate::new(node, self.zk, self.backon_builder);
+
+        let jh = tokio::spawn(
+            candidate
+                .observe(leader_sender)
+                .instrument(trace_span!("election_observer", my_path = %path)),
+        );
+
+        Ok((leader_receiver, jh.abort_handle()))
+    }
+}
+
 #[derive(Debug)]
 struct Candidate {
     zk: ZooKeeper,
@@ -160,100 +313,6 @@ impl Candidate {
     }
 }
 
-impl LeaderElection {
-    /// Create a new leader election struct
-    pub fn new(zk: ZooKeeper, election_node: &str, acl: &'static [Acl]) -> Self {
-        let backon_builder = ExponentialBuilder::default()
-            .with_jitter()
-            .with_min_delay(core::time::Duration::from_millis(100))
-            .with_max_delay(core::time::Duration::from_millis(5000))
-            .with_max_times(5);
-
-        Self {
-            election_prefix: election_node.to_string(),
-            zk,
-            backon_builder,
-            acl,
-        }
-    }
-    /// Participate in [leader election](https://zookeeper.apache.org/doc/current/recipes.html#sc_leaderElection)
-    ///
-    /// # Returns
-    ///
-    /// - A [tokio::sync::watch::Receiver] that resolves once this node becomes a
-    ///   leader. To stop participating, drop the underlying ZooKeeper connection,
-    ///   so that the underlying ephemeral znodes are removed.
-    /// - A [tokio::runtime::task::abort::AbortHandle]. Call .abort() to stop
-    ///   participating in leader election. If a connection to ZooKeeper is  kept
-    ///   alive after this call, the ephemeral nodes are not removed making it it
-    ///   seem like you're still participating
-    ///
-    /// Upon receiving from this receiver applications may consider creating a
-    /// separate znode to acknowledge that the leader has executed the leader
-    /// procedure.
-    pub async fn volunteer(
-        self,
-    ) -> Result<(watch::Receiver<LeadershipState>, AbortHandle), Whatever> {
-        info!("volunteering for leader election");
-
-        // Error handling with guids:
-        // https://zookeeper.apache.org/doc/current/recipes.html#sc_recipes_GuidNote
-        // "If a recoverable error occurs calling create() the client should
-        // call getChildren() and check for a node containing the guid used in the path
-        // name. This handles the case [...] of the create() succeeding on the
-        // server but the server crashing before returning the name of the new node."
-        let guid = Uuid::new_v4();
-        let path = match self
-            .zk
-            .create(
-                &format!("{}/{}-n_", self.election_prefix, guid),
-                &b""[..],
-                self.acl,
-                CreateMode::EphemeralSequential,
-            )
-            .await
-        {
-            Ok(create_res) => {
-                // if this is an err, it is "unrecoverable": no parent node, node already exists, etc.
-                create_res.whatever_context("can't create ephemeral node, unrecoverable error")?
-            }
-            Err(e) => {
-                warn!(
-                    "can't get children: {e}, recoverable error, will now try to find my guid again..."
-                );
-                (|| async {
-                    get_children(&self.zk, &self.election_prefix)
-                        .await
-                        .whatever_context(format!("can't get leader election nodes, retry failed"))
-                })
-                .retry(self.backon_builder)
-                .notify(|err, dur| {
-                    warn!("retrying {:?} after {:?}", err, dur);
-                })
-                .await?
-                .into_iter()
-                .find(|child| child.guid == guid)
-                .map(|child| child.full_path())
-                .whatever_context("can't find a znode with my guid")?
-            }
-        };
-
-        let node = ElectionChild::try_from_full_path(&path, &self.election_prefix)
-            .whatever_context("wrong format of the election child node")?;
-
-        let (leader_sender, leader_receiver) = watch::channel(LeadershipState::Uninitialized);
-        let candidate = Candidate::new(node, self.zk, self.backon_builder);
-
-        let jh = tokio::spawn(
-            candidate
-                .observe(leader_sender)
-                .instrument(trace_span!("election_observer", my_path = %path)),
-        );
-
-        Ok((leader_receiver, jh.abort_handle()))
-    }
-}
-
 #[derive(PartialEq, Eq, Debug)]
 struct ElectionChild {
     election_prefix: String,
@@ -336,12 +395,6 @@ mod tests {
     use super::*;
     use crate::{ZooKeeperBuilder, error::Create};
 
-    fn init_tracing_subscriber() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .try_init();
-    }
-
     #[test]
     fn parse_path() {
         init_tracing_subscriber();
@@ -382,6 +435,12 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), wait_for_leadership(&mut rx2))
             .await
             .expect("the second participant should now become the leader");
+    }
+
+    fn init_tracing_subscriber() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
     }
 
     async fn create_election_node(zk: &ZooKeeper) {
