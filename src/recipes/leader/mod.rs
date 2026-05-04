@@ -1,7 +1,6 @@
 use snafu::{OptionExt, ResultExt, Whatever, whatever};
 use tokio::task::AbortHandle;
-use tracing::{Instrument, error, warn};
-use tracing::{debug, info, trace_span};
+use tracing::{Instrument, debug, error, info, trace_span, warn};
 use uuid::Uuid;
 
 use crate::Acl;
@@ -46,7 +45,6 @@ struct Candidate {
     zk: ZooKeeper,
     node: ElectionChild,
     backon_builder: ExponentialBuilder,
-    // election_base_path: String,
 }
 
 impl Candidate {
@@ -55,7 +53,6 @@ impl Candidate {
             zk,
             node,
             backon_builder,
-            // election_base_path: election_base_path.to_string(),
         }
     }
 
@@ -69,7 +66,6 @@ impl Candidate {
                 .when(|e| e.to_string() == ZNODE_NOT_FOUND_ERROR_MSG)
                 .await
             {
-                // match self.observe_once(&leader_sender).await {
                 Ok(_) => continue,
                 Err(e) => {
                     error!("{e}");
@@ -187,7 +183,7 @@ impl LeaderElection {
     /// - A [tokio::sync::watch::Receiver] that resolves once this node becomes a
     ///   leader. To stop participating, drop the underlying ZooKeeper connection,
     ///   so that the underlying ephemeral znodes are removed.
-    /// - A [tokio::runtime::task::join::JoinHandle]. Call .abort() to stop
+    /// - A [tokio::runtime::task::abort::AbortHandle]. Call .abort() to stop
     ///   participating in leader election. If a connection to ZooKeeper is  kept
     ///   alive after this call, the ephemeral nodes are not removed making it it
     ///   seem like you're still participating
@@ -228,7 +224,7 @@ impl LeaderElection {
                 (|| async {
                     get_children(&self.zk, &self.election_prefix)
                         .await
-                        .whatever_context("can't get leader election nodes, retry failed")
+                        .whatever_context(format!("can't get leader election nodes, retry failed"))
                 })
                 .retry(self.backon_builder)
                 .notify(|err, dur| {
@@ -278,21 +274,7 @@ impl ElectionChild {
             whatever!("wrong format of a child node; must be `/prefix/path`");
         };
 
-        let path_parts = path.split("-n_").collect::<Vec<&str>>();
-        if path_parts.len() != 2 {
-            whatever!("wrong format of a child node's path; must `<guid>-n_<number>`");
-        }
-        let guid = Uuid::parse_str(path_parts[0]).whatever_context("Can't parse node's guid")?;
-        let seq = path_parts[1]
-            .parse::<u32>()
-            .whatever_context("cant parse node's sequential number as u32 from {full_path}: {e}")?;
-
-        Ok(Self {
-            election_prefix: election_prefix.to_string(),
-            path: path.to_string(),
-            guid,
-            seq,
-        })
+        ElectionChild::try_from_parts(election_prefix, path)
     }
 
     fn try_from_parts(prefix: &str, path: &str) -> Result<Self, crate::Error> {
@@ -349,6 +331,8 @@ async fn get_children(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::{ZooKeeperBuilder, error::Create};
 
@@ -381,44 +365,23 @@ mod tests {
         create_election_node(&zk1).await;
         let leader_election1 = LeaderElection::new(zk1, "/election", Acl::open_unsafe());
         let (mut rx1, jh1) = leader_election1.volunteer().await.unwrap();
-        assert!(
-            wait_for_leadership(&mut rx1).await,
-            "testing that the first participant becomes the leader"
-        );
+        tokio::time::timeout(Duration::from_secs(10), wait_for_leadership(&mut rx1))
+            .await
+            .expect("the first participant should be the leader");
 
         let (zk2, _w) = builder.connect(&connect_addr).await.unwrap();
         let leader_election2 = LeaderElection::new(zk2, "/election", Acl::open_unsafe());
         let (mut rx2, _jh2) = leader_election2.volunteer().await.unwrap();
 
-        assert_eq!(
-            wait_for_follower(&mut rx2).await,
-            true,
-            "testing that the second participant is not the leader"
-        );
+        tokio::time::timeout(Duration::from_secs(10), wait_for_follower(&mut rx2))
+            .await
+            .expect("the second participant should become follower");
 
         jh1.abort();
 
-        assert_eq!(
-            wait_for_leadership(&mut rx2).await,
-            true,
-            "testing that the second participant now becomes the leader"
-        );
-    }
-
-    async fn wait_for_leadership(rx: &mut tokio::sync::watch::Receiver<LeadershipState>) -> bool {
-        debug!("waiting for leadership");
-        loop {
-            let state = *rx.borrow_and_update();
-            match state {
-                LeadershipState::Leader => {
-                    return true;
-                }
-                LeadershipState::Uninitialized | LeadershipState::Follower => {
-                    rx.changed().await.unwrap()
-                }
-                _ => panic!("wait for leadership error {state:?}"),
-            }
-        }
+        tokio::time::timeout(Duration::from_secs(10), wait_for_leadership(&mut rx2))
+            .await
+            .expect("the second participant should now become the leader");
     }
 
     async fn create_election_node(zk: &ZooKeeper) {
@@ -439,7 +402,23 @@ mod tests {
         };
     }
 
-    async fn wait_for_follower(rx: &mut tokio::sync::watch::Receiver<LeadershipState>) -> bool {
+    async fn wait_for_leadership(rx: &mut tokio::sync::watch::Receiver<LeadershipState>) {
+        debug!("waiting for leadership");
+        loop {
+            let state = *rx.borrow_and_update();
+            match state {
+                LeadershipState::Leader => {
+                    return;
+                }
+                LeadershipState::Uninitialized | LeadershipState::Follower => {
+                    rx.changed().await.unwrap()
+                }
+                _ => panic!("wait for leadership error {state:?}"),
+            }
+        }
+    }
+
+    async fn wait_for_follower(rx: &mut tokio::sync::watch::Receiver<LeadershipState>) {
         debug!("waiting for follower");
         loop {
             let state = *rx.borrow_and_update();
@@ -448,7 +427,7 @@ mod tests {
                     rx.changed().await.unwrap()
                 }
                 LeadershipState::Follower => {
-                    return true;
+                    return;
                 }
                 _ => panic!("wait for follower error {state:?}"),
             }
