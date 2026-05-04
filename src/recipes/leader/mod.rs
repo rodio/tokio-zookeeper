@@ -350,7 +350,7 @@ async fn get_children(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ZooKeeperBuilder;
+    use crate::{ZooKeeperBuilder, error::Create};
 
     fn init_tracing_subscriber() {
         let _ = tracing_subscriber::fmt()
@@ -378,6 +378,7 @@ mod tests {
         init_tracing_subscriber();
 
         let (zk1, _w) = builder.connect(&connect_addr).await.unwrap();
+        create_election_node(&zk1).await;
         let leader_election1 = LeaderElection::new(zk1, "/election", Acl::open_unsafe());
         let (mut rx1, jh1) = leader_election1.volunteer().await.unwrap();
         assert!(
@@ -418,6 +419,24 @@ mod tests {
                 _ => panic!("wait for leadership error {state:?}"),
             }
         }
+    }
+
+    async fn create_election_node(zk: &ZooKeeper) {
+        let res = zk
+            .create(
+                "/election",
+                &b""[..],
+                Acl::open_unsafe(),
+                CreateMode::Persistent,
+            )
+            .await
+            .unwrap();
+
+        match res {
+            Ok(_) => {}
+            Err(e) if e == Create::NodeExists => {}
+            Err(e) => panic!("{e}"),
+        };
     }
 
     async fn wait_for_follower(rx: &mut tokio::sync::watch::Receiver<LeadershipState>) -> bool {
