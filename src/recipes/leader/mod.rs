@@ -1,21 +1,18 @@
+use snafu::Snafu;
 use snafu::{OptionExt, ResultExt, Whatever, whatever};
 use tokio::task::AbortHandle;
 use tracing::{Instrument, debug, error, info, trace_span, warn};
 use uuid::Uuid;
 
-use crate::Acl;
 use crate::CreateMode;
 use crate::WatchedEventType::NodeDeleted;
 use crate::ZooKeeper;
+use crate::{Acl, WatchedEvent};
 
 use tokio::sync::watch;
 
 use backon::ExponentialBuilder;
 use backon::Retryable;
-
-static CANT_SEND_ERROR_MSG: &str = "Can't send leadership state update";
-static RX_CANCELLED_ERROR_MSG: &str = "Watch receiver canceled, server disconnected?";
-static ZNODE_NOT_FOUND_ERROR_MSG: &str = "The ephemeral znode of the participant was not found";
 
 /// Participate in leader election through this struct
 #[derive(Debug)]
@@ -77,19 +74,19 @@ impl LeaderElection {
     /// ```ignore
     /// use tokio::select;
     /// use tokio_zookeeper::{Acl, ZooKeeper, recipes::leader::*};
-
+    ///
     /// fn init_tracing_subscriber() {
     ///     let _ = tracing_subscriber::fmt()
     ///         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
     ///         .init();
     /// }
-
+    ///
     /// #[tokio::main]
     /// async fn main() {
     ///     init_tracing_subscriber();
     ///     let binding = "127.0.0.1:2181".parse().unwrap();
     ///     let (zk, _default_watcher) = ZooKeeper::connect(&binding).await.unwrap();
-
+    ///
     ///     let leader_election = LeaderElection::new(zk, "/election", Acl::open_unsafe());
     ///     let (mut leader_receiver, _abort_handle) = leader_election.volunteer().await.unwrap();
     ///     loop {
@@ -163,7 +160,9 @@ impl LeaderElection {
                 (|| async {
                     get_children(&self.zk, &self.election_prefix)
                         .await
-                        .whatever_context(format!("can't get leader election nodes, retry failed"))
+                        .whatever_context(
+                            "can't get leader election nodes, retry failed".to_string(),
+                        )
                 })
                 .retry(self.backon_builder)
                 .notify(|err, dur| {
@@ -216,7 +215,7 @@ impl Candidate {
                 .notify(|err, dur| {
                     warn!("retrying {:?} after {:?}", err, dur);
                 })
-                .when(|e| e.to_string() == ZNODE_NOT_FOUND_ERROR_MSG)
+                .when(|e| matches!(e, LeaderElectionError::ZnodeNotFound))
                 .await
             {
                 Ok(_) => continue,
@@ -232,7 +231,7 @@ impl Candidate {
     async fn observe_once(
         &self,
         leader_sender: &watch::Sender<LeadershipState>,
-    ) -> Result<(), crate::Error> {
+    ) -> Result<(), LeaderElectionError> {
         let mut children: Vec<ElectionChild> =
             get_children(&self.zk, &self.node.election_prefix).await?;
         children.sort_unstable();
@@ -247,7 +246,7 @@ impl Candidate {
                 self.observe_follower(&children[index - 1], leader_sender)
                     .await?;
             }
-            None => whatever!("{}", ZNODE_NOT_FOUND_ERROR_MSG),
+            None => return Err(LeaderElectionError::ZnodeNotFound),
         };
 
         Ok(())
@@ -256,7 +255,7 @@ impl Candidate {
     async fn observe_leader(
         &self,
         leader_sender: &watch::Sender<LeadershipState>,
-    ) -> Result<(), crate::Error> {
+    ) -> Result<(), LeaderElectionError> {
         // start watching my own ephemeral node
         let (rx, stat) = self
             .zk
@@ -264,28 +263,26 @@ impl Candidate {
             .exists(&self.node.full_path())
             .await?;
         if stat.is_none() {
-            whatever!("Leader's znode was missing");
+            return Err(LeaderElectionError::ZnodeNotFound);
         }
 
         info!("i am the leader");
         leader_sender
             .send(LeadershipState::Leader)
-            .whatever_context(CANT_SEND_ERROR_MSG)?;
+            .map_err(|e| LeaderElectionError::SendError { source: e })?;
 
-        let event = rx.await.whatever_context(RX_CANCELLED_ERROR_MSG)?;
-
+        let event = rx
+            .await
+            .map_err(|e| LeaderElectionError::Canceled { source: e })?;
         error!(?event, "leader's ephemeral node changed");
-        whatever!(
-            "Unexpected change to the leader's node: {:?}",
-            event.event_type
-        );
+        Err(LeaderElectionError::UnexpectedNodeChange { change: event })
     }
 
     async fn observe_follower(
         &self,
         preceding_node: &ElectionChild,
         leader_sender: &watch::Sender<LeadershipState>,
-    ) -> Result<(), crate::Error> {
+    ) -> Result<(), LeaderElectionError> {
         let path = preceding_node.full_path();
         debug!(?path, "setting the watch for the preceding node");
 
@@ -297,18 +294,17 @@ impl Candidate {
 
         leader_sender
             .send(LeadershipState::Follower)
-            .whatever_context(CANT_SEND_ERROR_MSG)?;
+            .map_err(|e| LeaderElectionError::SendError { source: e })?;
 
-        let event = rx.await.whatever_context(RX_CANCELLED_ERROR_MSG)?;
+        let event = rx
+            .await
+            .map_err(|e| LeaderElectionError::Canceled { source: e })?;
         match event.event_type {
             NodeDeleted => {
                 debug!(?event, "the preceding node was removed");
                 Ok(())
             }
-            _ => whatever!(
-                "Unexpected change to the follower's node: {:?}",
-                event.event_type
-            ),
+            _ => Err(LeaderElectionError::UnexpectedNodeChange { change: event }),
         }
     }
 }
@@ -369,6 +365,27 @@ impl Ord for ElectionChild {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.seq.cmp(&other.seq)
     }
+}
+
+#[derive(Debug, Snafu)]
+enum LeaderElectionError {
+    #[snafu(
+        display("Watch receiver canceled, server disconnected?"),
+        context(false)
+    )]
+    Canceled {
+        source: futures::channel::oneshot::Canceled,
+    },
+    #[snafu(display("ZooKeeper error: {source}"), context(false))]
+    ZkError { source: crate::Error },
+    #[snafu(display("Error while sending leadership state update"), context(false))]
+    SendError {
+        source: watch::error::SendError<LeadershipState>,
+    },
+    #[snafu(display("Ephemeral znode for leader election not found"))]
+    ZnodeNotFound,
+    #[snafu(display("Unexpected change to ephemeral node: {change:?}"))]
+    UnexpectedNodeChange { change: WatchedEvent },
 }
 
 async fn get_children(
