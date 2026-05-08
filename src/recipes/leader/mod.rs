@@ -94,7 +94,7 @@ impl LeaderElection {
     ///     let binding = "127.0.0.1:2181".parse().unwrap();
     ///     let (zk, _default_watcher) = ZooKeeper::connect(&binding).await.unwrap();
     ///
-    ///     let leader_election = LeaderElection::new(zk, "/election", Acl::open_unsafe());
+    ///     let leader_election = LeaderElection::new(zk, "/election", Acl::open_unsafe().to_vec());
     ///     let (mut leader_receiver, _abort_handle) = leader_election.volunteer().await.unwrap();
     ///     loop {
     ///         let state = *leader_receiver.borrow_and_update();
@@ -445,6 +445,18 @@ mod tests {
         assert_eq!(c.path, format!("{}-n_000123", guid));
         assert_eq!(c.guid, guid);
         assert_eq!(c.full_path(), format!("/election/{}-n_000123", guid));
+
+        let bad_paths = vec![
+            format!("/election//{guid}-n_00123"),
+            format!("/election_bad/{guid}-n_00123"),
+            "/election/bad_path".to_string(),
+            "/election/bad-guid-n_00123".to_string(),
+            format!("/election/{guid}-n_badnumber"),
+        ];
+
+        for path in bad_paths {
+            assert!(ElectionChild::try_from_full_path(&path, "/election").is_err());
+        }
     }
 
     #[tokio::test]
