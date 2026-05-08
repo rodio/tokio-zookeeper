@@ -21,7 +21,7 @@ pub struct LeaderElection {
     election_prefix: String,
     zk: ZooKeeper,
     backon_builder: ExponentialBuilder,
-    acl: &'static [Acl],
+    acl: Vec<Acl>,
 }
 
 /// Represents the current state this node is in
@@ -39,7 +39,7 @@ pub enum LeadershipState {
 
 impl LeaderElection {
     /// Create a new leader election struct
-    pub fn new(zk: ZooKeeper, election_node: &str, acl: &'static [Acl]) -> Self {
+    pub fn new(zk: ZooKeeper, election_node: &str, acl: Vec<Acl>) -> Self {
         let backon_builder = ExponentialBuilder::default()
             .with_jitter()
             .with_min_delay(core::time::Duration::from_millis(100))
@@ -456,14 +456,14 @@ mod tests {
 
         let (zk1, _w) = builder.connect(&connect_addr).await.unwrap();
         create_election_node(&zk1).await;
-        let leader_election1 = LeaderElection::new(zk1, "/election", Acl::open_unsafe());
+        let leader_election1 = LeaderElection::new(zk1, "/election", Acl::open_unsafe().to_vec());
         let (mut rx1, jh1) = leader_election1.volunteer().await.unwrap();
         tokio::time::timeout(Duration::from_secs(10), wait_for_leadership(&mut rx1))
             .await
             .expect("the first participant should be the leader");
 
         let (zk2, _w) = builder.connect(&connect_addr).await.unwrap();
-        let leader_election2 = LeaderElection::new(zk2, "/election", Acl::open_unsafe());
+        let leader_election2 = LeaderElection::new(zk2, "/election", Acl::open_unsafe().to_vec());
         let (mut rx2, _jh2) = leader_election2.volunteer().await.unwrap();
 
         tokio::time::timeout(Duration::from_secs(10), wait_for_follower(&mut rx2))
