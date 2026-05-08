@@ -4,10 +4,10 @@ use tokio::task::AbortHandle;
 use tracing::{Instrument, debug, error, info, trace_span, warn};
 use uuid::Uuid;
 
-use crate::CreateMode;
-use crate::WatchedEventType::NodeDeleted;
+use crate::WatchedEventType::{self, NodeDeleted};
 use crate::ZooKeeper;
 use crate::{Acl, WatchedEvent};
+use crate::{CreateMode, KeeperState};
 
 use tokio::sync::watch;
 
@@ -68,6 +68,14 @@ impl LeaderElection {
     /// Upon receiving from this receiver applications may consider creating a
     /// separate znode to acknowledge that the leader has executed the leader
     /// procedure.
+    ///
+    /// Does not automatically re-create ephemeral nodes for participation but
+    /// sends an error whenever session expires or other unexpected events or
+    /// errors occur in the process. Only these
+    /// transitions are possible:
+    /// - Uninitialized -> Leader -> Error
+    /// - Uninitialized -> Follower -> Error
+    /// - Uninitialized -> Follower -> Leader -> Error
     ///
     /// Here is an example of how this might be used:
     ///
@@ -274,8 +282,17 @@ impl Candidate {
         let event = rx
             .await
             .map_err(|e| LeaderElectionError::Canceled { source: e })?;
-        error!(?event, "leader's ephemeral node changed");
-        Err(LeaderElectionError::UnexpectedNodeChange { change: event })
+        match (event.event_type, event.keeper_state) {
+            (NodeDeleted, _) => Err(LeaderElectionError::UnexpectedEvent { change: event }),
+            (WatchedEventType::None, KeeperState::Expired | KeeperState::AuthFailed) => {
+                Err(LeaderElectionError::UnexpectedEvent { change: event })
+            }
+            _ => {
+                // transient disconnects, SyncConnected, SaslAuthenticated, NodeDataChanged events etc.
+                debug!(?event, "retryable event, will retry");
+                Ok(())
+            }
+        }
     }
 
     async fn observe_follower(
@@ -299,12 +316,19 @@ impl Candidate {
         let event = rx
             .await
             .map_err(|e| LeaderElectionError::Canceled { source: e })?;
-        match event.event_type {
-            NodeDeleted => {
+        match (event.event_type, event.keeper_state) {
+            (NodeDeleted, _) => {
                 debug!(?event, "the preceding node was removed");
                 Ok(())
             }
-            _ => Err(LeaderElectionError::UnexpectedNodeChange { change: event }),
+            (WatchedEventType::None, KeeperState::Expired | KeeperState::AuthFailed) => {
+                Err(LeaderElectionError::UnexpectedEvent { change: event })
+            }
+            _ => {
+                // transient disconnects, SyncConnected, SaslAuthenticated, NodeDataChanged events, etc.
+                debug!(?event, "retryable event, will retry");
+                Ok(())
+            }
         }
     }
 }
@@ -384,8 +408,8 @@ enum LeaderElectionError {
     },
     #[snafu(display("Ephemeral znode for leader election not found"))]
     ZnodeNotFound,
-    #[snafu(display("Unexpected change to ephemeral node: {change:?}"))]
-    UnexpectedNodeChange { change: WatchedEvent },
+    #[snafu(display("Unexpected event received: {change:?}"))]
+    UnexpectedEvent { change: WatchedEvent },
 }
 
 async fn get_children(
