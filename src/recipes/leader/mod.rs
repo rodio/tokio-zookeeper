@@ -33,7 +33,7 @@ pub enum LeadershipState {
     Leader,
     /// Leadership participation procedure has not yet started
     Uninitialized,
-    /// An error has occured in the leader election procedure
+    /// An error has occurred in the leader election procedure; terminal state
     Error,
 }
 
@@ -57,13 +57,13 @@ impl LeaderElection {
     ///
     /// # Returns
     ///
-    /// - A [tokio::sync::watch::Receiver] that resolves once this node becomes a
-    ///   leader. To stop participating, drop the underlying ZooKeeper connection,
-    ///   so that the underlying ephemeral znodes are removed.
+    /// - A [tokio::sync::watch::Receiver] that resolves once this node becomes
+    ///   a leader. To stop participating, drop the underlying ZooKeeper
+    ///   connection, so that the underlying ephemeral znodes are removed.
     /// - A [tokio::runtime::task::abort::AbortHandle]. Call .abort() to stop
-    ///   participating in leader election. If a connection to ZooKeeper is  kept
-    ///   alive after this call, the ephemeral nodes are not removed making it it
-    ///   seem like you're still participating
+    ///   participating in leader election. If a connection to ZooKeeper is
+    ///   kept alive after this call, the ephemeral nodes are not removed making
+    ///   it it seem like you're still participating
     ///
     /// Upon receiving from this receiver applications may consider creating a
     /// separate znode to acknowledge that the leader has executed the leader
@@ -71,8 +71,7 @@ impl LeaderElection {
     ///
     /// Does not automatically re-create ephemeral nodes for participation but
     /// sends an error whenever session expires or other unexpected events or
-    /// errors occur in the process. Only these
-    /// transitions are possible:
+    /// errors occur in the process. Only these transitions are possible:
     /// - Uninitialized -> Leader -> Error
     /// - Uninitialized -> Follower -> Error
     /// - Uninitialized -> Follower -> Leader -> Error
@@ -163,7 +162,7 @@ impl LeaderElection {
             }
             Err(e) => {
                 warn!(
-                    "can't get children: {e}, recoverable error, will now try to find my guid again..."
+                    "can't create ephemeral node : {e}, recoverable error, will now try to find my guid again..."
                 );
                 (|| async {
                     get_children(&self.zk, &self.election_prefix)
