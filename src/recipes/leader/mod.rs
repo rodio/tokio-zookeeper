@@ -132,7 +132,6 @@ impl LeaderElection {
     ///         }
     ///     }
     /// }
-    ///
     /// ```
     pub async fn volunteer(
         self,
