@@ -78,7 +78,7 @@ impl LeaderElection {
     ///
     /// Here is an example of how this might be used:
     ///
-    /// ```ignore
+    /// ```no_run
     /// use tokio::select;
     /// use tokio_zookeeper::{Acl, ZooKeeper, recipes::leader::*};
     ///
