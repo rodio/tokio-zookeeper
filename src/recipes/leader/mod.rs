@@ -282,7 +282,10 @@ impl Candidate {
             .await
             .map_err(|e| LeaderElectionError::Canceled { source: e })?;
         match (event.event_type, event.keeper_state) {
-            (NodeDeleted, _) => Err(LeaderElectionError::UnexpectedEvent { change: event }),
+            (NodeDeleted, _) => {
+                error!("Leader's ephemeral node was deleted");
+                Err(LeaderElectionError::UnexpectedEvent { change: event })
+            }
             (WatchedEventType::None, KeeperState::Expired | KeeperState::AuthFailed) => {
                 Err(LeaderElectionError::UnexpectedEvent { change: event })
             }
