@@ -1,13 +1,13 @@
 use snafu::Snafu;
-use snafu::{OptionExt, ResultExt, Whatever, whatever};
+use snafu::{ResultExt, whatever};
 use tokio::task::AbortHandle;
 use tracing::{Instrument, debug, error, info, trace_span, warn};
 use uuid::Uuid;
 
 use crate::WatchedEventType::{self, NodeDeleted};
-use crate::ZooKeeper;
 use crate::{Acl, WatchedEvent};
 use crate::{CreateMode, KeeperState};
+use crate::{ZooKeeper, error};
 
 use tokio::sync::watch;
 
@@ -135,7 +135,7 @@ impl LeaderElection {
     /// ```
     pub async fn volunteer(
         self,
-    ) -> Result<(watch::Receiver<LeadershipState>, AbortHandle), Whatever> {
+    ) -> Result<(watch::Receiver<LeadershipState>, AbortHandle), VolunteeringError> {
         info!("volunteering for leader election");
 
         // Error handling with guids:
@@ -157,33 +157,28 @@ impl LeaderElection {
         {
             Ok(create_res) => {
                 // if this is an err, it is "unrecoverable": no parent node, node already exists, etc.
-                create_res.whatever_context("can't create ephemeral node, unrecoverable error")?
+                create_res?
             }
             Err(e) => {
                 warn!(
                     "can't create ephemeral node : {e}, recoverable error, will now try to find my guid again..."
                 );
-                (|| async {
-                    get_children(&self.zk, &self.election_prefix)
-                        .await
-                        .whatever_context(
-                            "can't get leader election nodes, retry failed".to_string(),
-                        )
-                })
-                .retry(self.backon_builder)
-                .notify(|err, dur| {
-                    warn!("retrying {:?} after {:?}", err, dur);
-                })
-                .await?
-                .into_iter()
-                .find(|child| child.guid == guid)
-                .map(|child| child.full_path())
-                .whatever_context("can't find a znode with my guid")?
+                (|| async { get_children(&self.zk, &self.election_prefix).await })
+                    .retry(self.backon_builder)
+                    .notify(|err, dur| {
+                        warn!("retrying {:?} after {:?}", err, dur);
+                    })
+                    .await
+                    .map_err(|e| VolunteeringError::GetChildrenError { source: e })?
+                    .into_iter()
+                    .find(|child| child.guid == guid)
+                    .map(|child| child.full_path())
+                    .ok_or(VolunteeringError::NodeNotFound)?
             }
         };
 
         let node = ElectionChild::try_from_full_path(&path, &self.election_prefix)
-            .whatever_context("wrong format of the election child node")?;
+            .expect("get_children should return only well-formatted paths");
 
         let (leader_sender, leader_receiver) = watch::channel(LeadershipState::Uninitialized);
         let candidate = Candidate::new(node, self.zk, self.backon_builder);
@@ -196,6 +191,28 @@ impl LeaderElection {
 
         Ok((leader_receiver, jh.abort_handle()))
     }
+}
+
+/// Errors that may appear in the process of volunteering for leadership
+#[derive(Debug, Snafu)]
+pub enum VolunteeringError {
+    /// Ephemeral znode for leadership election could not be created
+    #[snafu(display("ZNode creation error"), context(false))]
+    NodeCreationError {
+        /// The underlying tokio_zookeeper's create error
+        source: error::Create,
+    },
+    /// Ephemeral znode with the generated GUID was not found among the children of the election znode
+    #[snafu(display(
+        "Ephemeral ZNode with the generated GUID was not found among the children of the election znode"
+    ))]
+    NodeNotFound,
+    /// Could not get children of the election znode
+    #[snafu(display("Could not get children of the election znode"))]
+    GetChildrenError {
+        /// The underlying tokio_zookeeper error
+        source: crate::Error,
+    },
 }
 
 #[derive(Debug)]
