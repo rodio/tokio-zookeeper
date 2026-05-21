@@ -60,7 +60,7 @@ impl LeaderElection {
     /// - A [tokio::sync::watch::Receiver] that resolves once this node becomes
     ///   a leader. To stop participating, drop the underlying ZooKeeper
     ///   connection, so that the underlying ephemeral znodes are removed.
-    /// - A [tokio::runtime::task::abort::AbortHandle]. Call .abort() to stop
+    /// - A [tokio::runtime::task::AbortHandle]. Call .abort() to stop
     ///   participating in leader election. If a connection to ZooKeeper is
     ///   kept alive after this call, the ephemeral nodes are not removed making
     ///   it it seem like you're still participating
